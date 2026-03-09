@@ -1,42 +1,52 @@
-"""Orchestrator - coordinates parallel negotiations across multiple providers."""
+"""Orchestrator - coordinates parallel negotiations with session management."""
 import asyncio
-import uuid
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import AsyncGenerator
 from .models import (
     NegotiationRequest, NegotiationSession, ProviderNegotiation,
-    NegotiationMessage, NegotiationUpdate, NegotiationStrategy
+    NegotiationMessage, NegotiationUpdate
 )
 from .providers import generate_provider, get_provider_response
-from .negotiator import negotiate_turn, create_opening_offer
+from .negotiator import negotiate_turn, create_opening
+from .config import get_settings, logger
 
-# In-memory session storage (would use Redis/DB in production)
-sessions: dict[str, NegotiationSession] = {}
+# Thread-safe session storage with TTL
+_sessions: dict[str, tuple[NegotiationSession, datetime]] = {}
+_lock = asyncio.Lock()
+
+
+async def cleanup_expired() -> None:
+    """Remove expired sessions."""
+    settings = get_settings()
+    async with _lock:
+        now = datetime.now()
+        expired = [
+            sid for sid, (_, created) in _sessions.items()
+            if now - created > timedelta(seconds=settings.session_ttl_seconds)
+        ]
+        for sid in expired:
+            del _sessions[sid]
+            logger.info(f"Cleaned up expired session: {sid}")
 
 
 async def create_session(request: NegotiationRequest) -> NegotiationSession:
-    """Create a new negotiation session with multiple providers."""
-    session_id = str(uuid.uuid4())[:8]
-
-    # Generate providers with different personalities
+    """Create new negotiation session with secure ID."""
+    await cleanup_expired()
+    session_id = secrets.token_urlsafe(16)  # Secure 128-bit ID
     base_price = (request.target_price + request.max_price) / 2
-    providers = []
 
+    providers = []
     for i in range(request.num_providers):
-        provider_data = generate_provider(request.item_description, base_price, i)
-        provider = ProviderNegotiation(
-            provider_id=provider_data["provider_id"],
-            provider_name=provider_data["provider_name"],
-            personality=provider_data["personality"],
-            initial_price=provider_data["initial_price"],
-            current_price=provider_data["initial_price"],
-            status="negotiating",
-            messages=[],
-            rounds=0
-        )
-        # Store min_price separately (internal)
-        provider._min_price = provider_data["min_price"]
-        providers.append(provider)
+        data = generate_provider(base_price, i)
+        providers.append(ProviderNegotiation(
+            provider_id=data["provider_id"],
+            provider_name=data["provider_name"],
+            personality=data["personality"],
+            initial_price=data["initial_price"],
+            current_price=data["initial_price"],
+            min_price=data["min_price"],
+        ))
 
     session = NegotiationSession(
         session_id=session_id,
@@ -45,212 +55,164 @@ async def create_session(request: NegotiationRequest) -> NegotiationSession:
         max_price=request.max_price,
         strategy=request.strategy,
         providers=providers,
-        status="in_progress"
+        created_at=datetime.now().isoformat()
     )
 
-    sessions[session_id] = session
+    async with _lock:
+        _sessions[session_id] = (session, datetime.now())
+    logger.info(f"Created session {session_id} with {len(providers)} providers")
     return session
 
 
-async def run_negotiation_round(
-    session: NegotiationSession,
-    provider: ProviderNegotiation,
-    provider_min_price: float
-) -> tuple[NegotiationUpdate, bool]:
-    """Run a single round of negotiation with one provider."""
+async def get_session(session_id: str) -> NegotiationSession | None:
+    """Get session by ID (thread-safe)."""
+    async with _lock:
+        item = _sessions.get(session_id)
+        return item[0] if item else None
 
-    # Check if first round
-    if provider.rounds == 0:
-        # Opening offer from our negotiator
-        action = await create_opening_offer(
-            item_description=session.item_description,
-            target_price=session.target_price,
-            max_price=session.max_price,
-            strategy=session.strategy,
-            provider_name=provider.provider_name,
-            provider_initial_price=provider.initial_price
+
+async def run_round(session: NegotiationSession, provider: ProviderNegotiation) -> tuple[NegotiationUpdate, bool]:
+    """Run single negotiation round with one provider."""
+    try:
+        # Get negotiator action
+        if provider.rounds == 0:
+            action = await create_opening(
+                session.item_description, session.target_price, session.max_price,
+                session.strategy, provider.provider_name, provider.initial_price
+            )
+        else:
+            last_msg = next((m for m in reversed(provider.messages) if m.role == "provider"), None)
+            action = await negotiate_turn(
+                session.item_description, session.target_price, session.max_price,
+                session.strategy, provider.provider_name,
+                provider.current_price or provider.initial_price,
+                [m.model_dump() for m in provider.messages],
+                last_msg.message if last_msg else "",
+                last_msg.amount if last_msg else None
+            )
+
+        # Record negotiator message
+        provider.messages.append(NegotiationMessage(
+            role="negotiator", action=action.action,
+            amount=action.amount, message=action.message,
+            timestamp=datetime.now().isoformat()
+        ))
+
+        # Handle terminal actions
+        if action.action == "accept":
+            provider.status = "accepted"
+            return NegotiationUpdate(
+                session_id=session.session_id, provider_id=provider.provider_id,
+                event_type="deal_found",
+                data={"status": "accepted", "price": provider.current_price, "msg": action.message}
+            ), True
+
+        if action.action == "walk_away":
+            provider.status = "walked_away"
+            return NegotiationUpdate(
+                session_id=session.session_id, provider_id=provider.provider_id,
+                event_type="status_change", data={"status": "walked_away", "msg": action.message}
+            ), True
+
+        # Get provider response
+        response = await get_provider_response(
+            provider.personality, provider.initial_price, provider.min_price,
+            provider.current_price or provider.initial_price,
+            [m.model_dump() for m in provider.messages],
+            action.message, action.amount
         )
-    else:
-        # Get the provider's last message
-        provider_messages = [m for m in provider.messages if m.role == "provider"]
-        last_provider_msg = provider_messages[-1] if provider_messages else None
 
-        action = await negotiate_turn(
-            item_description=session.item_description,
-            target_price=session.target_price,
-            max_price=session.max_price,
-            strategy=session.strategy,
-            provider_name=provider.provider_name,
-            provider_current_price=provider.current_price or provider.initial_price,
-            conversation_history=[m.model_dump() for m in provider.messages],
-            provider_latest_message=last_provider_msg.message if last_provider_msg else "",
-            provider_latest_offer=last_provider_msg.amount if last_provider_msg else None
-        )
+        provider.messages.append(NegotiationMessage(
+            role="provider", action=response.action,
+            amount=response.amount, message=response.message,
+            timestamp=datetime.now().isoformat()
+        ))
 
-    # Record our action
-    timestamp = datetime.now().isoformat()
-    provider.messages.append(NegotiationMessage(
-        role="negotiator",
-        action=action.action,
-        amount=action.amount,
-        message=action.message,
-        timestamp=timestamp
-    ))
+        if response.amount:
+            provider.current_price = response.amount
+        provider.rounds += 1
 
-    # Check for terminal actions
-    if action.action == "accept":
-        provider.status = "accepted"
+        if response.action == "accept":
+            provider.status = "accepted"
+            provider.current_price = action.amount
+            return NegotiationUpdate(
+                session_id=session.session_id, provider_id=provider.provider_id,
+                event_type="deal_found",
+                data={"status": "accepted", "price": action.amount, "msg": response.message}
+            ), True
+
+        if response.action == "reject":
+            provider.status = "rejected"
+            return NegotiationUpdate(
+                session_id=session.session_id, provider_id=provider.provider_id,
+                event_type="status_change", data={"status": "rejected", "msg": response.message}
+            ), True
+
         return NegotiationUpdate(
-            session_id=session.session_id,
-            provider_id=provider.provider_id,
-            event_type="status_change",
-            data={
-                "status": "accepted",
-                "final_price": provider.current_price,
-                "message": action.message
-            }
+            session_id=session.session_id, provider_id=provider.provider_id,
+            event_type="message",
+            data={"round": provider.rounds, "price": provider.current_price,
+                  "negotiator": action.model_dump(), "provider": response.model_dump()}
+        ), False
+
+    except Exception as e:
+        logger.error(f"Round error for {provider.provider_id}: {e}")
+        provider.status = "error"
+        return NegotiationUpdate(
+            session_id=session.session_id, provider_id=provider.provider_id,
+            event_type="error", data={"status": "error", "msg": "Negotiation error"}
         ), True
 
-    if action.action == "walk_away":
-        provider.status = "walked_away"
-        return NegotiationUpdate(
-            session_id=session.session_id,
-            provider_id=provider.provider_id,
-            event_type="status_change",
-            data={"status": "walked_away", "message": action.message}
-        ), True
 
-    # Get provider response
-    provider_response = await get_provider_response(
-        personality=provider.personality,
-        initial_price=provider.initial_price,
-        min_price=provider_min_price,
-        current_price=provider.current_price or provider.initial_price,
-        conversation_history=[m.model_dump() for m in provider.messages],
-        customer_message=action.message,
-        customer_offer=action.amount
-    )
-
-    # Record provider response
-    provider.messages.append(NegotiationMessage(
-        role="provider",
-        action=provider_response.action,
-        amount=provider_response.amount,
-        message=provider_response.message,
-        timestamp=datetime.now().isoformat()
-    ))
-
-    # Update current price if provider made an offer
-    if provider_response.amount:
-        provider.current_price = provider_response.amount
-
-    provider.rounds += 1
-
-    # Check if provider accepted or rejected
-    if provider_response.action == "accept":
-        provider.status = "accepted"
-        provider.current_price = action.amount  # They accepted our offer
-        return NegotiationUpdate(
-            session_id=session.session_id,
-            provider_id=provider.provider_id,
-            event_type="deal_found",
-            data={
-                "status": "accepted",
-                "final_price": action.amount,
-                "provider_message": provider_response.message
-            }
-        ), True
-
-    if provider_response.action == "reject":
-        provider.status = "rejected"
-        return NegotiationUpdate(
-            session_id=session.session_id,
-            provider_id=provider.provider_id,
-            event_type="status_change",
-            data={"status": "rejected", "message": provider_response.message}
-        ), True
-
-    # Negotiation continues
-    return NegotiationUpdate(
-        session_id=session.session_id,
-        provider_id=provider.provider_id,
-        event_type="message",
-        data={
-            "negotiator_action": action.model_dump(),
-            "provider_response": provider_response.model_dump(),
-            "round": provider.rounds
-        }
-    ), False
-
-
-async def run_parallel_negotiations(
-    session_id: str,
-    max_rounds: int = 5
-) -> AsyncGenerator[NegotiationUpdate, None]:
-    """Run negotiations with all providers in parallel, yielding updates."""
-
-    session = sessions.get(session_id)
+async def run_negotiations(session_id: str) -> AsyncGenerator[NegotiationUpdate, None]:
+    """Run all negotiations with heartbeat."""
+    settings = get_settings()
+    session = await get_session(session_id)
     if not session:
         return
 
-    # Store min prices separately
-    min_prices = {}
-    for p in session.providers:
-        min_prices[p.provider_id] = getattr(p, '_min_price', p.initial_price * 0.7)
+    for round_num in range(settings.max_rounds):
+        # Send heartbeat
+        yield NegotiationUpdate(
+            session_id=session_id, provider_id="system",
+            event_type="heartbeat", data={"round": round_num + 1}
+        )
 
-    for round_num in range(max_rounds):
-        # Get providers still negotiating
-        active_providers = [p for p in session.providers if p.status == "negotiating"]
-
-        if not active_providers:
+        active = [p for p in session.providers if p.status == "negotiating"]
+        if not active:
             break
 
-        # Run all negotiations in parallel
-        tasks = []
-        for provider in active_providers:
-            task = run_negotiation_round(session, provider, min_prices[provider.provider_id])
-            tasks.append((provider.provider_id, task))
+        # Run rounds in parallel
+        tasks = [run_round(session, p) for p in active]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Gather results
-        results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
-
-        for (provider_id, _), result in zip(tasks, results):
+        for provider, result in zip(active, results):
             if isinstance(result, Exception):
+                logger.error(f"Task error: {result}")
+                provider.status = "error"
                 yield NegotiationUpdate(
-                    session_id=session_id,
-                    provider_id=provider_id,
-                    event_type="status_change",
-                    data={"status": "error", "message": str(result)}
+                    session_id=session_id, provider_id=provider.provider_id,
+                    event_type="error", data={"msg": "Task failed"}
                 )
             else:
-                update, is_complete = result
+                update, _ = result
                 yield update
 
         session.total_rounds = round_num + 1
-
-        # Small delay between rounds
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
     # Find best deal
     accepted = [p for p in session.providers if p.status == "accepted"]
     if accepted:
-        best = min(accepted, key=lambda p: p.current_price or float('inf'))
-        session.best_deal = best
-        yield NegotiationUpdate(
-            session_id=session_id,
-            provider_id=best.provider_id,
-            event_type="completed",
-            data={
-                "best_provider": best.provider_name,
-                "best_price": best.current_price,
-                "total_providers": len(session.providers),
-                "deals_found": len(accepted)
-            }
-        )
+        session.best_deal = min(accepted, key=lambda p: p.current_price or float('inf'))
 
     session.status = "completed"
-
-
-def get_session(session_id: str) -> NegotiationSession | None:
-    """Get a session by ID."""
-    return sessions.get(session_id)
+    yield NegotiationUpdate(
+        session_id=session_id, provider_id="system",
+        event_type="completed",
+        data={
+            "best": session.best_deal.provider_name if session.best_deal else None,
+            "price": session.best_deal.current_price if session.best_deal else None,
+            "deals": len(accepted), "total": len(session.providers)
+        }
+    )

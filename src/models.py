@@ -1,7 +1,8 @@
-"""Pydantic models for the negotiation system."""
+"""Pydantic models for the negotiation system - compact and validated."""
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from enum import Enum
+import re
 
 
 class NegotiationStrategy(str, Enum):
@@ -11,40 +12,58 @@ class NegotiationStrategy(str, Enum):
 
 
 class ProviderPersonality(str, Enum):
-    FIRM = "firm"           # Rarely budges, high initial prices
-    FLEXIBLE = "flexible"   # Willing to negotiate
-    DESPERATE = "desperate" # Needs the business, will go low
-    PREMIUM = "premium"     # High quality, justifies higher prices
+    FIRM = "firm"
+    FLEXIBLE = "flexible"
+    DESPERATE = "desperate"
+    PREMIUM = "premium"
 
 
 class NegotiationRequest(BaseModel):
-    """Request to start a new negotiation session."""
-    item_description: str = Field(..., description="What you're negotiating for")
-    target_price: float = Field(..., description="Your ideal price")
-    max_price: float = Field(..., description="Maximum you're willing to pay")
-    num_providers: int = Field(default=5, ge=1, le=10, description="Number of providers to negotiate with")
+    """Request to start a negotiation - validated."""
+    item_description: str = Field(..., min_length=5, max_length=500)
+    target_price: float = Field(..., gt=0, le=1_000_000)
+    max_price: float = Field(..., gt=0, le=1_000_000)
+    num_providers: int = Field(default=5, ge=1, le=10)
     strategy: NegotiationStrategy = Field(default=NegotiationStrategy.BALANCED)
+
+    @field_validator("item_description")
+    @classmethod
+    def sanitize_description(cls, v: str) -> str:
+        """Remove potential prompt injection patterns."""
+        dangerous = ["ignore previous", "disregard", "new instructions", "system:"]
+        lower = v.lower()
+        for pattern in dangerous:
+            if pattern in lower:
+                raise ValueError(f"Invalid content in description")
+        return re.sub(r"[<>{}]", "", v)[:500]
+
+    @field_validator("max_price")
+    @classmethod
+    def max_gte_target(cls, v: float, info) -> float:
+        if "target_price" in info.data and v < info.data["target_price"]:
+            raise ValueError("max_price must be >= target_price")
+        return v
 
 
 class NegotiationAction(BaseModel):
-    """Structured output from the negotiator agent."""
+    """Structured output from negotiator agent."""
     action: Literal["offer", "counter", "accept", "reject", "ask_question", "walk_away"]
-    amount: float | None = Field(default=None, description="Price amount if applicable")
-    message: str = Field(..., description="Message to send to the provider")
-    reasoning: str = Field(..., description="Internal reasoning for this action")
-    confidence: float = Field(default=0.5, ge=0, le=1, description="Confidence in this action")
+    amount: float | None = Field(default=None, ge=0, le=1_000_000)
+    message: str = Field(..., max_length=500)
+    reasoning: str = Field(..., max_length=500)
+    confidence: float = Field(default=0.5, ge=0, le=1)
 
 
 class ProviderResponse(BaseModel):
-    """Response from a simulated provider."""
+    """Response from simulated provider."""
     action: Literal["offer", "counter", "accept", "reject", "provide_info"]
-    amount: float | None = None
-    message: str
-    final: bool = False  # If true, this is their final offer
+    amount: float | None = Field(default=None, ge=0, le=1_000_000)
+    message: str = Field(..., max_length=500)
+    final: bool = False
 
 
 class NegotiationMessage(BaseModel):
-    """A single message in the negotiation conversation."""
+    """Single message in conversation."""
     role: Literal["negotiator", "provider"]
     action: str
     amount: float | None
@@ -53,33 +72,35 @@ class NegotiationMessage(BaseModel):
 
 
 class ProviderNegotiation(BaseModel):
-    """State of negotiation with a single provider."""
+    """State of negotiation with one provider."""
     provider_id: str
     provider_name: str
     personality: ProviderPersonality
     initial_price: float
     current_price: float | None = None
-    status: Literal["negotiating", "accepted", "rejected", "walked_away"] = "negotiating"
+    min_price: float = 0  # Internal, not exposed to client
+    status: Literal["negotiating", "accepted", "rejected", "walked_away", "error"] = "negotiating"
     messages: list[NegotiationMessage] = []
     rounds: int = 0
 
 
 class NegotiationSession(BaseModel):
-    """Overall negotiation session state."""
+    """Overall session state."""
     session_id: str
     item_description: str
     target_price: float
     max_price: float
     strategy: NegotiationStrategy
     providers: list[ProviderNegotiation] = []
-    status: Literal["in_progress", "completed", "cancelled"] = "in_progress"
+    status: Literal["in_progress", "completed", "cancelled", "error"] = "in_progress"
     best_deal: ProviderNegotiation | None = None
     total_rounds: int = 0
+    created_at: str = ""
 
 
 class NegotiationUpdate(BaseModel):
-    """Real-time update sent to frontend."""
+    """Real-time update for SSE."""
     session_id: str
     provider_id: str
-    event_type: Literal["message", "status_change", "deal_found", "completed"]
+    event_type: Literal["message", "status_change", "deal_found", "completed", "heartbeat", "error"]
     data: dict

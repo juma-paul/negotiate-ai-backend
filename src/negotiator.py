@@ -1,116 +1,92 @@
 """Pydantic AI Negotiator Agent - the core AI that negotiates on your behalf."""
+import asyncio
 from pydantic_ai import Agent
 from .models import NegotiationAction, NegotiationStrategy
+from .config import get_settings, logger
 
-# Lazy initialization
-_negotiator_agent = None
+_negotiator_agent: Agent[None, NegotiationAction] | None = None
 
-def get_negotiator_agent():
+
+def get_negotiator_agent() -> Agent[None, NegotiationAction]:
+    """Lazy init negotiator agent."""
     global _negotiator_agent
     if _negotiator_agent is None:
+        settings = get_settings()
         _negotiator_agent = Agent(
-            'openai:gpt-4o',
+            f'openai:{settings.openai_model}',
             result_type=NegotiationAction,
-            system_prompt="""You are an expert negotiator AI agent. Your job is to get the best possible price for your client.
-
-You will receive:
-1. What the client wants to purchase/book
-2. Their target price (ideal)
-3. Their maximum price (absolute limit)
-4. Your negotiation strategy
-5. The conversation history with the provider
-6. The provider's latest response
-
-STRATEGIES:
-- AGGRESSIVE: Push hard for the lowest price. Make low offers, be willing to walk away.
-- BALANCED: Aim for fair deals. Counter reasonably, build rapport.
-- CONSERVATIVE: Prioritize getting a deal done. Accept reasonable offers quickly.
-
-RULES:
-1. NEVER exceed the client's maximum price
-2. Always try to get below the target price if possible
-3. Use psychological tactics: anchoring, silence, walking away
-4. Read the provider's signals - are they desperate? Firm?
-5. Know when to close the deal vs push further
-
-Your response must include:
-- action: what to do (offer, counter, accept, reject, ask_question, walk_away)
-- amount: the price you're proposing (if applicable)
-- message: what to say to the provider
-- reasoning: your internal thought process (for logging)
-- confidence: how confident you are this is the right move (0-1)"""
+            system_prompt="""Expert negotiator AI. Get the best price for your client.
+STRATEGIES: AGGRESSIVE (low offers, walk away), BALANCED (fair deals), CONSERVATIVE (quick deals).
+RULES: Never exceed max_price, aim below target, know when to close. Keep messages under 100 words."""
         )
     return _negotiator_agent
 
 
 async def negotiate_turn(
-    item_description: str,
-    target_price: float,
-    max_price: float,
-    strategy: NegotiationStrategy,
-    provider_name: str,
-    provider_current_price: float,
-    conversation_history: list[dict],
-    provider_latest_message: str,
-    provider_latest_offer: float | None
+    item: str, target: float, max_price: float, strategy: NegotiationStrategy,
+    provider: str, current_price: float, history: list[dict],
+    latest_msg: str, latest_offer: float | None
 ) -> NegotiationAction:
-    """Execute one turn of negotiation."""
-
+    """Execute one negotiation turn with timeout."""
+    settings = get_settings()
     history_text = "\n".join([
-        f"{'You' if m['role'] == 'negotiator' else 'Provider'}: {m['message']} " +
-        (f"[${m['amount']}]" if m.get('amount') else "")
-        for m in conversation_history[-8:]
+        f"{'You' if m['role'] == 'negotiator' else 'Provider'}: {m['message']}"
+        + (f" [${m['amount']}]" if m.get('amount') else "")
+        for m in history[-6:]
     ])
 
-    prompt = f"""
-NEGOTIATION CONTEXT:
-- Item: {item_description}
-- Your target price: ${target_price}
-- Your maximum price: ${max_price}
-- Strategy: {strategy.value.upper()}
-- Provider: {provider_name}
-- Provider's current price: ${provider_current_price}
+    prompt = f"""Item: {item} | Target: ${target} | Max: ${max_price} | Strategy: {strategy.value.upper()}
+Provider: {provider} | Current price: ${current_price}
+History: {history_text or 'None'}
+Latest: "{latest_msg}" {f'Offer: ${latest_offer}' if latest_offer else ''}
+Your move?"""
 
-CONVERSATION HISTORY:
-{history_text if history_text else "No previous messages - this is the start of negotiation."}
+    try:
+        result = await asyncio.wait_for(
+            get_negotiator_agent().run(prompt),
+            timeout=settings.api_timeout
+        )
+        return result.output
+    except asyncio.TimeoutError:
+        logger.warning(f"Negotiator timeout for {provider}")
+        return NegotiationAction(
+            action="counter", amount=target, message="I need to think. My offer stands.",
+            reasoning="Timeout fallback", confidence=0.3
+        )
+    except Exception as e:
+        logger.error(f"Negotiator error: {e}")
+        return NegotiationAction(
+            action="ask_question", message="Could you clarify your position?",
+            reasoning=f"Error recovery: {str(e)[:50]}", confidence=0.2
+        )
 
-PROVIDER'S LATEST RESPONSE:
-"{provider_latest_message}"
-{f"Provider's offer: ${provider_latest_offer}" if provider_latest_offer else ""}
 
-What is your next move? Remember your strategy is {strategy.value.upper()}.
-"""
-
-    result = await get_negotiator_agent().run(prompt)
-    return result.output
-
-
-async def create_opening_offer(
-    item_description: str,
-    target_price: float,
-    max_price: float,
-    strategy: NegotiationStrategy,
-    provider_name: str,
-    provider_initial_price: float
+async def create_opening(
+    item: str, target: float, max_price: float, strategy: NegotiationStrategy,
+    provider: str, asking_price: float
 ) -> NegotiationAction:
-    """Create the opening offer to a provider."""
+    """Create opening offer with timeout."""
+    settings = get_settings()
+    prompt = f"""NEW NEGOTIATION | Item: {item} | Target: ${target} | Max: ${max_price}
+Strategy: {strategy.value.upper()} | Provider: {provider} | Asking: ${asking_price}
+Make opening offer. AGGRESSIVE: 60-70%, BALANCED: 75-85%, CONSERVATIVE: 85-90% of ask."""
 
-    prompt = f"""
-NEW NEGOTIATION STARTING:
-- Item: {item_description}
-- Your target price: ${target_price}
-- Your maximum price: ${max_price}
-- Strategy: {strategy.value.upper()}
-- Provider: {provider_name}
-- Provider's asking price: ${provider_initial_price}
-
-This is the FIRST message. Create an opening offer or question.
-If using AGGRESSIVE strategy, start low (maybe 60-70% of their ask).
-If BALANCED, start around 75-85%.
-If CONSERVATIVE, start around 85-90%.
-
-Make your opening move.
-"""
-
-    result = await get_negotiator_agent().run(prompt)
-    return result.output
+    try:
+        result = await asyncio.wait_for(
+            get_negotiator_agent().run(prompt),
+            timeout=settings.api_timeout
+        )
+        return result.output
+    except asyncio.TimeoutError:
+        pct = {"aggressive": 0.65, "balanced": 0.8, "conservative": 0.88}[strategy.value]
+        return NegotiationAction(
+            action="offer", amount=round(asking_price * pct, 2),
+            message=f"I'd like to offer ${round(asking_price * pct, 2)} for this.",
+            reasoning="Timeout fallback", confidence=0.5
+        )
+    except Exception as e:
+        logger.error(f"Opening offer error: {e}")
+        return NegotiationAction(
+            action="ask_question", message="Can you tell me more about your service?",
+            reasoning=f"Error: {str(e)[:50]}", confidence=0.2
+        )

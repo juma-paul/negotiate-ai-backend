@@ -1,15 +1,8 @@
-"""Simulated providers with different negotiation personalities."""
-import random
+"""Provider AI agent for simulating trucking company responses."""
 import asyncio
 from pydantic_ai import Agent
 from .models import ProviderPersonality, ProviderResponse
 from .config import get_settings, logger
-
-PROVIDER_NAMES = [
-    "QuickShip Logistics", "FastFreight Co", "Budget Haulers Inc",
-    "Premium Transport", "Lightning Delivery", "Steady Eddie Trucking",
-    "CrossCountry Carriers", "Reliable Routes LLC", "Express Lane Shipping", "ValueMove Transport"
-]
 
 _provider_agent: Agent[None, ProviderResponse] | None = None
 
@@ -21,35 +14,18 @@ def get_provider_agent() -> Agent[None, ProviderResponse]:
         settings = get_settings()
         _provider_agent = Agent(
             f'openai:{settings.openai_model_mini}',
-            output_type=ProviderResponse,  # Changed from result_type
-            system_prompt="""You simulate a service provider in a negotiation.
-Respond according to personality: FIRM (5-10% discount max), FLEXIBLE (15-25% off),
-DESPERATE (30-40% off, accept quickly), PREMIUM (justify high prices, small discounts).
-Set 'final'=true for absolute final offer. Keep messages under 100 words."""
+            output_type=ProviderResponse,
+            system_prompt="""You simulate a trucking company dispatcher in a freight rate negotiation.
+Respond according to personality:
+- FIRM: Hard negotiator, 5-10% discount max, stands ground
+- FLEXIBLE: Reasonable, willing to negotiate 15-25% off for good customers
+- DESPERATE: Needs business badly, accept quickly, 30-40% off possible
+- PREMIUM: Luxury service, justify high prices, small discounts only
+
+Set 'final'=true for your absolute final offer. Keep messages under 100 words.
+Be realistic - you're a trucking company, talk about capacity, routes, fuel costs."""
         )
     return _provider_agent
-
-
-def generate_provider(base_price: float, index: int) -> dict:
-    """Generate provider with personality and pricing."""
-    personality = random.choice(list(ProviderPersonality))
-    multipliers = {
-        ProviderPersonality.FIRM: (1.1, 1.3, 0.9, 0.95),
-        ProviderPersonality.FLEXIBLE: (1.0, 1.2, 0.75, 0.85),
-        ProviderPersonality.DESPERATE: (0.9, 1.1, 0.6, 0.7),
-        ProviderPersonality.PREMIUM: (1.2, 1.5, 0.85, 0.95),
-    }
-    price_low, price_high, min_low, min_high = multipliers[personality]
-    initial = base_price * random.uniform(price_low, price_high)
-    min_price = base_price * random.uniform(min_low, min_high)
-
-    return {
-        "provider_id": f"p{index}",
-        "provider_name": PROVIDER_NAMES[index % len(PROVIDER_NAMES)],
-        "personality": personality,
-        "initial_price": round(initial, 2),
-        "min_price": round(min_price, 2),
-    }
 
 
 async def get_provider_response(

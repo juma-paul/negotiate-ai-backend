@@ -1,74 +1,75 @@
-"""Orchestrator - coordinates parallel negotiations with session management."""
+"""Orchestrator - coordinates parallel negotiations with database persistence."""
 import asyncio
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import AsyncGenerator
 from .models import (
     NegotiationRequest, NegotiationSession, ProviderNegotiation,
     NegotiationMessage, NegotiationUpdate
 )
-from .providers import generate_provider, get_provider_response
+from .providers import get_provider_response
 from .negotiator import negotiate_turn, create_opening
 from .config import get_settings, logger
+from .repositories import CompanyRepo, SessionRepo
 
-# Thread-safe session storage with TTL
-_sessions: dict[str, tuple[NegotiationSession, datetime]] = {}
+# In-memory cache for active sessions (to avoid DB reads during negotiation)
+_active_sessions: dict[str, NegotiationSession] = {}
 _lock = asyncio.Lock()
 
 
-async def cleanup_expired() -> None:
-    """Remove expired sessions."""
-    settings = get_settings()
-    async with _lock:
-        now = datetime.now()
-        expired = [
-            sid for sid, (_, created) in _sessions.items()
-            if now - created > timedelta(seconds=settings.session_ttl_seconds)
-        ]
-        for sid in expired:
-            del _sessions[sid]
-            logger.info(f"Cleaned up expired session: {sid}")
-
-
-async def create_session(request: NegotiationRequest) -> NegotiationSession:
-    """Create new negotiation session with secure ID."""
-    await cleanup_expired()
-    session_id = secrets.token_urlsafe(16)  # Secure 128-bit ID
+async def create_session(request: NegotiationRequest, user_id: str | None = None) -> NegotiationSession:
+    """Create new negotiation session with database persistence."""
     base_price = (request.target_price + request.max_price) / 2
 
-    providers = []
-    for i in range(request.num_providers):
-        data = generate_provider(base_price, i)
-        providers.append(ProviderNegotiation(
-            provider_id=data["provider_id"],
-            provider_name=data["provider_name"],
-            personality=data["personality"],
-            initial_price=data["initial_price"],
-            current_price=data["initial_price"],
-            min_price=data["min_price"],
-        ))
+    # Get random providers from database
+    providers = await CompanyRepo.get_random_providers(request.num_providers, base_price)
 
-    session = NegotiationSession(
-        session_id=session_id,
+    if not providers:
+        raise ValueError("No providers available")
+
+    # Create session in database
+    session = await SessionRepo.create(
+        user_id=user_id,
         item_description=request.item_description,
         target_price=request.target_price,
         max_price=request.max_price,
         strategy=request.strategy,
-        providers=providers,
-        created_at=datetime.now().isoformat()
+        providers=providers
     )
 
+    # Cache for active negotiation
     async with _lock:
-        _sessions[session_id] = (session, datetime.now())
-    logger.info(f"Created session {session_id} with {len(providers)} providers")
+        _active_sessions[session.session_id] = session
+
+    logger.info(f"Created session {session.session_id} with {len(providers)} providers")
     return session
 
 
 async def get_session(session_id: str) -> NegotiationSession | None:
-    """Get session by ID (thread-safe)."""
+    """Get session by ID - check cache first, then database."""
+    # Check cache first (for active negotiations)
     async with _lock:
-        item = _sessions.get(session_id)
-        return item[0] if item else None
+        if session_id in _active_sessions:
+            return _active_sessions[session_id]
+
+    # Fall back to database
+    session = await SessionRepo.get(session_id)
+    if session and session.status == "in_progress":
+        # Cache active sessions
+        async with _lock:
+            _active_sessions[session_id] = session
+    return session
+
+
+async def cancel_session(session_id: str) -> bool:
+    """Cancel a session."""
+    # Remove from cache
+    async with _lock:
+        _active_sessions.pop(session_id, None)
+
+    # Update in database
+    await SessionRepo.cancel_session(session_id)
+    logger.info(f"Session {session_id} cancelled")
+    return True
 
 
 async def run_round(session: NegotiationSession, provider: ProviderNegotiation) -> tuple[NegotiationUpdate, bool]:
@@ -91,16 +92,26 @@ async def run_round(session: NegotiationSession, provider: ProviderNegotiation) 
                 last_msg.amount if last_msg else None
             )
 
-        # Record negotiator message
+        # Record negotiator message (in-memory)
         provider.messages.append(NegotiationMessage(
             role="negotiator", action=action.action,
             amount=action.amount, message=action.message,
             timestamp=datetime.now().isoformat()
         ))
 
+        # Persist to database
+        await SessionRepo.add_message(
+            session.session_id, provider.provider_id,
+            "negotiator", action.action, action.amount, action.message
+        )
+
         # Handle terminal actions
         if action.action == "accept":
             provider.status = "accepted"
+            await SessionRepo.update_provider(
+                session.session_id, provider.provider_id,
+                status="accepted", rounds=provider.rounds
+            )
             return NegotiationUpdate(
                 session_id=session.session_id, provider_id=provider.provider_id,
                 event_type="deal_found",
@@ -109,6 +120,10 @@ async def run_round(session: NegotiationSession, provider: ProviderNegotiation) 
 
         if action.action == "walk_away":
             provider.status = "walked_away"
+            await SessionRepo.update_provider(
+                session.session_id, provider.provider_id,
+                status="walked_away", rounds=provider.rounds
+            )
             return NegotiationUpdate(
                 session_id=session.session_id, provider_id=provider.provider_id,
                 event_type="status_change", data={"status": "walked_away", "msg": action.message}
@@ -128,13 +143,29 @@ async def run_round(session: NegotiationSession, provider: ProviderNegotiation) 
             timestamp=datetime.now().isoformat()
         ))
 
+        # Persist provider message
+        await SessionRepo.add_message(
+            session.session_id, provider.provider_id,
+            "provider", response.action, response.amount, response.message
+        )
+
         if response.amount:
             provider.current_price = response.amount
         provider.rounds += 1
 
+        # Update provider in database
+        await SessionRepo.update_provider(
+            session.session_id, provider.provider_id,
+            current_price=provider.current_price, rounds=provider.rounds
+        )
+
         if response.action == "accept":
             provider.status = "accepted"
             provider.current_price = action.amount
+            await SessionRepo.update_provider(
+                session.session_id, provider.provider_id,
+                current_price=action.amount, status="accepted"
+            )
             return NegotiationUpdate(
                 session_id=session.session_id, provider_id=provider.provider_id,
                 event_type="deal_found",
@@ -143,6 +174,10 @@ async def run_round(session: NegotiationSession, provider: ProviderNegotiation) 
 
         if response.action == "reject":
             provider.status = "rejected"
+            await SessionRepo.update_provider(
+                session.session_id, provider.provider_id,
+                status="rejected"
+            )
             return NegotiationUpdate(
                 session_id=session.session_id, provider_id=provider.provider_id,
                 event_type="status_change", data={"status": "rejected", "msg": response.message}
@@ -158,6 +193,9 @@ async def run_round(session: NegotiationSession, provider: ProviderNegotiation) 
     except Exception as e:
         logger.error(f"Round error for {provider.provider_id}: {e}")
         provider.status = "error"
+        await SessionRepo.update_provider(
+            session.session_id, provider.provider_id, status="error"
+        )
         return NegotiationUpdate(
             session_id=session.session_id, provider_id=provider.provider_id,
             event_type="error", data={"status": "error", "msg": "Negotiation error"}
@@ -207,6 +245,31 @@ async def run_negotiations(session_id: str) -> AsyncGenerator[NegotiationUpdate,
         session.best_deal = min(accepted, key=lambda p: p.current_price or float('inf'))
 
     session.status = "completed"
+
+    # Persist completion to database
+    await SessionRepo.complete_session(
+        session_id,
+        best_deal_company_id=session.best_deal.provider_id if session.best_deal else None,
+        best_deal_price=session.best_deal.current_price if session.best_deal else None,
+        total_rounds=session.total_rounds
+    )
+
+    # Save results for analytics (for each accepted deal)
+    for provider in accepted:
+        await SessionRepo.save_result(
+            user_id=None,  # TODO: pass user_id through session
+            session_id=session_id,
+            company_id=provider.provider_id,
+            initial_price=provider.initial_price,
+            final_price=provider.current_price or provider.initial_price,
+            strategy=session.strategy.value,
+            rounds_taken=provider.rounds
+        )
+
+    # Remove from active cache
+    async with _lock:
+        _active_sessions.pop(session_id, None)
+
     yield NegotiationUpdate(
         session_id=session_id, provider_id="system",
         event_type="completed",

@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """App settings from environment."""
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-4o-mini"  # Use mini for both (gpt-4o requires Tier 1+)
     openai_model_mini: str = "gpt-4o-mini"
     api_timeout: int = 30
     max_rounds: int = 5

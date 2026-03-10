@@ -21,7 +21,7 @@ def get_provider_agent() -> Agent[None, ProviderResponse]:
         settings = get_settings()
         _provider_agent = Agent(
             f'openai:{settings.openai_model_mini}',
-            result_type=ProviderResponse,
+            output_type=ProviderResponse,  # Changed from result_type
             system_prompt="""You simulate a service provider in a negotiation.
 Respond according to personality: FIRM (5-10% discount max), FLEXIBLE (15-25% off),
 DESPERATE (30-40% off, accept quickly), PREMIUM (justify high prices, small discounts).

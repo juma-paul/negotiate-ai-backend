@@ -10,7 +10,7 @@ from .models import NegotiationRequest, NegotiationSession
 from .orchestrator import create_session, run_negotiations, get_session
 from .config import get_settings, logger
 
-# Rate limiting (simple in-memory)
+# Rate limiting (simple in-memory) - more permissive
 _request_counts: dict[str, list[float]] = {}
 
 
@@ -32,19 +32,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS - restrictive in production
+# CORS - allow frontend
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins + ["http://localhost:3000"],
-    allow_credentials=False,  # No credentials for SSE
+    allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
 
-def check_rate_limit(ip: str, limit: int = 10, window: int = 60) -> bool:
-    """Simple rate limiter - 10 requests per minute per IP."""
+def check_rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
+    """Rate limiter - 60 requests per minute per IP (more permissive)."""
     import time
     now = time.time()
     if ip not in _request_counts:
@@ -58,11 +58,13 @@ def check_rate_limit(ip: str, limit: int = 10, window: int = 60) -> bool:
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    """Rate limiting middleware."""
+    """Rate limiting middleware - only for POST requests."""
     ip = request.client.host if request.client else "unknown"
-    if request.url.path.startswith("/api/") and not check_rate_limit(ip):
-        logger.warning(f"Rate limit exceeded for {ip}")
-        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+    # Only rate limit POST (session creation), not GET (status checks)
+    if request.method == "POST" and request.url.path.startswith("/api/"):
+        if not check_rate_limit(ip, limit=10, window=60):  # 10 new sessions/min
+            logger.warning(f"Rate limit exceeded for {ip}")
+            return JSONResponse(status_code=429, content={"detail": "Too many requests"})
     return await call_next(request)
 
 
@@ -130,7 +132,7 @@ async def stream_negotiation(session_id: str):
 
     return EventSourceResponse(
         event_generator(),
-        ping=15,  # Heartbeat every 15 seconds
+        ping=15,
         ping_message_factory=lambda: {"event": "ping", "data": "{}"}
     )
 

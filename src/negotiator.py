@@ -14,7 +14,7 @@ def get_negotiator_agent() -> Agent[None, NegotiationAction]:
         settings = get_settings()
         _negotiator_agent = Agent(
             f'openai:{settings.openai_model}',
-            result_type=NegotiationAction,
+            output_type=NegotiationAction,  # Changed from result_type
             system_prompt="""Expert negotiator AI. Get the best price for your client.
 STRATEGIES: AGGRESSIVE (low offers, walk away), BALANCED (fair deals), CONSERVATIVE (quick deals).
 RULES: Never exceed max_price, aim below target, know when to close. Keep messages under 100 words."""

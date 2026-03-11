@@ -58,6 +58,7 @@ class SessionRepo:
 
         return NegotiationSession(
             session_id=session_id,
+            user_id=user_id,
             item_description=item_description,
             target_price=target_price,
             max_price=max_price,
@@ -139,6 +140,7 @@ class SessionRepo:
 
         return NegotiationSession(
             session_id=session["id"],
+            user_id=session["user_id"],
             item_description=session["item_description"],
             target_price=session["target_price"],
             max_price=session["max_price"],

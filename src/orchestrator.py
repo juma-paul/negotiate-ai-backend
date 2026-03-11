@@ -257,7 +257,7 @@ async def run_negotiations(session_id: str) -> AsyncGenerator[NegotiationUpdate,
     # Save results for analytics (for each accepted deal)
     for provider in accepted:
         await SessionRepo.save_result(
-            user_id=None,  # TODO: pass user_id through session
+            user_id=session.user_id,  # Use user_id from session
             session_id=session_id,
             company_id=provider.provider_id,
             initial_price=provider.initial_price,

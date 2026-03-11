@@ -87,6 +87,7 @@ class ProviderNegotiation(BaseModel):
 class NegotiationSession(BaseModel):
     """Overall session state."""
     session_id: str
+    user_id: str | None = None  # Track user for history
     item_description: str
     target_price: float
     max_price: float
